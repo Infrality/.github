@@ -1,0 +1,55 @@
+name: Release Please
+
+# Reusable: keeps one "release" pull request per repository (CHANGELOG.md + version
+# bump from the conventional commits) and, when it is merged, creates the vX.Y.Z tag
+# and GitHub release.
+#
+# A tag created with the default GITHUB_TOKEN does not start other workflows. Two
+# ways round that, both supported:
+#   - the caller reacts to the `release_created` / `tag_name` outputs below in a
+#     second job (that is what the callers in app, api, … do for the image), or
+#   - the caller passes `RELEASE_PLEASE_TOKEN` (a PAT or app token), and tag-triggered
+#     workflows (the agent's goreleaser release.yml) start on their own.
+#
+# The repository needs Settings → Actions → "Allow GitHub Actions to create and
+# approve pull requests" (a repo setting; it is not a paid feature).
+on:
+  workflow_call:
+    inputs:
+      config-file:
+        type: string
+        default: release-please-config.json
+      manifest-file:
+        type: string
+        default: .release-please-manifest.json
+    secrets:
+      RELEASE_PLEASE_TOKEN:
+        required: false
+    outputs:
+      release_created:
+        description: "'true' when this run tagged a release."
+        value: ${{ jobs.release-please.outputs.release_created }}
+      tag_name:
+        description: The tag that was created (v1.2.3).
+        value: ${{ jobs.release-please.outputs.tag_name }}
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - id: rp
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: ${{ inputs.config-file }}
+          manifest-file: ${{ inputs.manifest-file }}
