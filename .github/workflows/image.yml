@@ -1,0 +1,244 @@
+name: Container image
+
+# Reusable image pipeline: build, scan, then (release only) push, SBOM, sign.
+#
+# THIS FILE'S PATH IS A CONTRACT. scripts/deploy-service.sh in the platform repo
+# verifies, before it pulls anything, that the digest was signed by
+#
+#   https://github.com/Infrality/(.github|<repo>)/.github/workflows/image.yml@refs/(heads/main|tags/v.+)
+#
+# Keyless cosign signs with the identity of the *called* workflow, so callers must
+# use `Infrality/.github/.github/workflows/image.yml@main` (a branch or SHA other
+# than main yields an identity the servers refuse), and this file must not be
+# renamed or moved. The final step verifies exactly that and fails the job if the
+# signature would not be accepted.
+#
+# Caller (pull request, no push):
+#   with: { image: app, push: false }
+# Caller (release, needs packages: write and id-token: write):
+#   with: { image: app, ref: v1.4.0 }
+#
+# The registry never holds an unscanned tag: the image is pushed by digest, scanned
+# at that digest, and only then given its semver tag and signed. An image that fails
+# Trivy stays an untagged, unsigned blob that ghcr-retention removes; deploy.sh would
+# refuse it anyway.
+#
+# linux/amd64 only (arm64 later: pass platforms, and add QEMU on a hosted runner).
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Repository name under ghcr.io/infrality/ (api, app, website, docs, admin).
+        type: string
+        required: true
+      ref:
+        description: Release tag to build and publish (v1.2.3). Empty with push=false builds the caller's ref.
+        type: string
+        default: ''
+      push:
+        description: Publish (push, SBOM, signature). false = build and scan only.
+        type: boolean
+        default: true
+      context:
+        type: string
+        default: .
+      dockerfile:
+        type: string
+        default: Dockerfile
+      target:
+        type: string
+        default: ''
+      build-args:
+        description: Newline-separated KEY=VALUE. Nothing environment-specific belongs here.
+        type: string
+        default: ''
+      platforms:
+        type: string
+        default: linux/amd64
+      runs-on:
+        description: Runner label. GitHub-hosted for now; the homelab runner later.
+        type: string
+        default: ubuntu-latest
+    outputs:
+      digest:
+        description: sha256 digest of the pushed image.
+        value: ${{ jobs.image.outputs.digest }}
+      reference:
+        description: ghcr.io/infrality/<image>@sha256:<digest>
+        value: ${{ jobs.image.outputs.reference }}
+      version:
+        description: Semver without the leading v.
+        value: ${{ jobs.image.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: Build, scan${{ inputs.push && ', sign' || '' }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      reference: ${{ steps.name.outputs.repo }}@${{ steps.push.outputs.digest }}
+      version: ${{ steps.name.outputs.version }}
+
+    steps:
+      - id: name
+        env:
+          IMAGE: ${{ inputs.image }}
+          REF: ${{ inputs.ref }}
+          PUSH: ${{ inputs.push }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || { echo "::error::bad image name '$IMAGE'"; exit 1; }
+          version=ci
+          if [ "$PUSH" = true ]; then
+            # Only a release tag is published: the tag is the version, and a
+            # branch name would make a registry tag nobody asked for.
+            if [[ ! "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::push needs a release tag like v1.2.3 as 'ref', not '$REF'"
+              exit 1
+            fi
+            version="${REF#v}"
+          fi
+          {
+            echo "repo=ghcr.io/${OWNER,,}/${IMAGE}"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        if: inputs.push
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Pull request: build here, scan here, publish nothing ─────────────────
+      - name: Build (not published)
+        if: ${{ !inputs.push }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          target: ${{ inputs.target }}
+          build-args: ${{ inputs.build-args }}
+          platforms: ${{ inputs.platforms }}
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: scan.local/${{ inputs.image }}:ci
+          cache-from: type=gha,scope=${{ inputs.image }}
+          cache-to: type=gha,scope=${{ inputs.image }},mode=max
+
+      # ── Release: push by digest only, tag after the scan ─────────────────────
+      - id: push
+        name: Build and push by digest
+        if: inputs.push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          target: ${{ inputs.target }}
+          build-args: ${{ inputs.build-args }}
+          platforms: ${{ inputs.platforms }}
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ steps.name.outputs.repo }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ inputs.image }}
+          cache-to: type=gha,scope=${{ inputs.image }},mode=max
+
+      # Trivy's vulnerability database, refreshed at most once a day.
+      - id: day
+        run: echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .trivy-cache
+          key: trivy-db-${{ steps.day.outputs.date }}
+          restore-keys: trivy-db-
+
+      # The binary by digest rather than trivy-action: the action's tags were
+      # rewritten to a credential stealer in March 2026. A fixed image cannot be.
+      - name: Trivy (fail on HIGH/CRITICAL)
+        env:
+          LOCAL: scan.local/${{ inputs.image }}:ci
+          REMOTE: ${{ steps.name.outputs.repo }}@${{ steps.push.outputs.digest }}
+          PUSH: ${{ inputs.push }}
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p .trivy-cache
+          if [ "$PUSH" = true ]; then
+            target="$REMOTE"; mounts=(-e TRIVY_USERNAME -e TRIVY_PASSWORD)
+          else
+            target="$LOCAL"; mounts=(-v /var/run/docker.sock:/var/run/docker.sock)
+          fi
+          docker run --rm "${mounts[@]}" \
+            -v "$PWD/.trivy-cache:/root/.cache/trivy" \
+            aquasec/trivy:0.75.0@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa \
+            image --scanners vuln,secret --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 1 --no-progress "$target"
+
+      # ── Release only: tag, SBOM, signature ───────────────────────────────────
+      - name: Tag the scanned digest
+        if: inputs.push
+        env:
+          REPO: ${{ steps.name.outputs.repo }}
+          VERSION: ${{ steps.name.outputs.version }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: docker buildx imagetools create --tag "${REPO}:${VERSION}" "${REPO}@${DIGEST}"
+
+      - name: SBOM (syft)
+        if: inputs.push
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ steps.name.outputs.repo }}@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: true
+          upload-release-assets: false
+
+      # The same cosign the servers run (platform setup-server.sh), so what is
+      # signed here is in a format the server's verify reads.
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        if: inputs.push
+        with:
+          cosign-release: v3.1.4
+
+      # Keyless: the signing identity is this workflow, not a key anyone holds.
+      - name: Sign and attach the SBOM
+        if: inputs.push
+        env:
+          REF: ${{ steps.name.outputs.repo }}@${{ steps.push.outputs.digest }}
+        run: |
+          cosign sign --yes "$REF"
+          cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$REF"
+
+      # The same check the server makes (platform scripts/deploy-service.sh). A caller
+      # on the wrong ref, or this file moved, fails here instead of at deploy time.
+      - name: Verify as the server will
+        if: inputs.push
+        env:
+          REF: ${{ steps.name.outputs.repo }}@${{ steps.push.outputs.digest }}
+          IMAGE: ${{ inputs.image }}
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github\\.com/Infrality/(\\.github|${IMAGE})/\\.github/workflows/image\\.yml@refs/(heads/main|tags/v.+)\$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$REF" > /dev/null
+          echo "### ${REF}" >> "$GITHUB_STEP_SUMMARY"
