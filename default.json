@@ -1,0 +1,50 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Shared Renovate preset for every Infrality repository: extends github>Infrality/.github",
+  "extends": [
+    "config:best-practices",
+    ":semanticCommits",
+    ":semanticCommitTypeAll(chore)",
+    ":dependencyDashboard"
+  ],
+  "baseBranchPatterns": ["dev"],
+  "timezone": "Europe/Paris",
+  "schedule": ["before 6am on the first day of the month"],
+  "minimumReleaseAge": "7 days",
+  "prHourlyLimit": 4,
+  "prConcurrentLimit": 6,
+  "labels": ["dependencies"],
+  "vulnerabilityAlerts": {
+    "schedule": ["at any time"],
+    "labels": ["dependencies", "security"],
+    "minimumReleaseAge": null,
+    "baseBranchPatterns": ["main"]
+  },
+  "packageRules": [
+    {
+      "description": "Our own reusable workflows are called by branch (@main) on purpose: the cosign identity the servers verify names that ref.",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["Infrality/.github"],
+      "enabled": false
+    },
+    {
+      "description": "One pull request for all action bumps.",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["!Infrality/.github"],
+      "groupName": "github actions",
+      "semanticCommitType": "ci"
+    },
+    {
+      "description": "npm and Go modules: minor and patch together.",
+      "matchManagers": ["npm", "gomod"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "dependencies (minor and patch)"
+    },
+    {
+      "description": "Container base images, pinned by digest.",
+      "matchManagers": ["dockerfile", "docker-compose"],
+      "groupName": "container images",
+      "pinDigests": true
+    }
+  ]
+}
