@@ -1,0 +1,164 @@
+name: Deploy production
+
+# Reusable. Production is deployed ONLY by a person pressing the button: the
+# repository's deploy-prod.yml is `workflow_dispatch` with one input, `ref` (a
+# release tag). Never on push. The organisation is on the Free plan (no Environment
+# approvals, no branch protection), so the safeguards are in this file instead:
+#
+#   1. it runs from a workflow_dispatch on main, nothing else;
+#   2. `ref` must be a release tag (vX.Y.Z) that is in main's history;
+#   3. the digest of ghcr.io/infrality/<image>:<version> is resolved here, and its
+#      cosign signature is verified on the runner BEFORE the network is opened;
+#   4. the runner joins the tailnet as tag:ci with an ephemeral key (ACL: SSH to
+#      tag:prod only), and runs exactly one command, which the server's
+#      infrality-ssh-gate checks again:  deploy.sh <service> <image@sha256:…>
+#   5. the server verifies the signature itself, rolls out with no downtime, runs the
+#      smoke test and rolls back on failure (platform docs/DEPLOYING.md).
+#
+# Secrets the caller passes: TS_AUTHKEY (ephemeral, tag:ci), SSH_DEPLOY_KEY (the key
+# whose authorized_keys line carries `infrality-ssh-gate <role>`), SSH_KNOWN_HOSTS
+# (the server's host key, from `ssh-keyscan` run from a trusted machine — not fetched
+# here, so a hijacked tailnet name cannot be trusted on first use).
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: backend | dashboard | website | docs | admin
+        type: string
+        required: true
+      image:
+        description: Repository under ghcr.io/infrality/ (api, app, website, docs, admin).
+        type: string
+        required: true
+      ref:
+        description: Release tag to deploy (v1.2.3).
+        type: string
+        required: true
+      ssh-host:
+        description: The VPS on the tailnet (MagicDNS name or 100.x address).
+        type: string
+        required: true
+      ssh-user:
+        type: string
+        required: true
+      smoke-url:
+        description: Optional public URL polled from the runner after the deploy.
+        type: string
+        default: ''
+    secrets:
+      TS_AUTHKEY:
+        required: true
+      SSH_DEPLOY_KEY:
+        required: true
+      SSH_KNOWN_HOSTS:
+        required: true
+
+permissions:
+  contents: read
+
+# One deploy of a service at a time, never cancelled halfway.
+concurrency:
+  group: deploy-prod-${{ inputs.service }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.service }} ${{ inputs.ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Only from the button, on main, for a release tag
+        env:
+          EVENT: ${{ github.event_name }}
+          WORKFLOW_REF: ${{ github.ref }}
+          SERVICE: ${{ inputs.service }}
+          IMAGE: ${{ inputs.image }}
+          TAG: ${{ inputs.ref }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ "$EVENT" = workflow_dispatch ] || { echo "::error::production deploys run on workflow_dispatch only, not '$EVENT'"; exit 1; }
+          [ "$WORKFLOW_REF" = refs/heads/main ] || { echo "::error::run this workflow from main, not '$WORKFLOW_REF'"; exit 1; }
+          [[ "$SERVICE" =~ ^(backend|dashboard|website|docs|admin)$ ]] || { echo "::error::unknown service '$SERVICE'"; exit 1; }
+          [[ "$IMAGE" =~ ^(api|app|website|docs|admin)$ ]] || { echo "::error::unknown image '$IMAGE'"; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::ref must be a release tag like v1.2.3, got '$TAG'"; exit 1; }
+          # A tag only counts if it is in main's history (behind = an ancestor).
+          status="$(gh api "repos/${REPO}/compare/main...${TAG}" --jq .status)"
+          case "$status" in behind|identical) ;; *) echo "::error::$TAG is not in main's history (compare says '$status')"; exit 1 ;; esac
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: image
+        name: Resolve the digest and verify its signature
+        env:
+          IMAGE: ${{ inputs.image }}
+          SERVICE: ${{ inputs.service }}
+          TAG: ${{ inputs.ref }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${OWNER,,}/${IMAGE}"
+          digest="$(docker buildx imagetools inspect "${repo}:${TAG#v}" --format '{{.Manifest.Digest}}')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image ${repo}:${TAG#v}; was the release image published?"; exit 1; }
+          cosign verify \
+            --certificate-identity-regexp "^https://github\\.com/Infrality/(\\.github|${IMAGE})/\\.github/workflows/image\\.yml@refs/(heads/main|tags/v.+)\$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${repo}@${digest}" > /dev/null
+          echo "reference=${repo}@${digest}" >> "$GITHUB_OUTPUT"
+          echo "### ${SERVICE} → ${repo}@${digest}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Join the tailnet as tag:ci
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          version: 1.104.4
+          hostname: gha-deploy-${{ github.run_id }}
+
+      - name: Install the deploy key and the pinned host key
+        env:
+          DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          (umask 077; printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key)
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      # The one command this key may run. The server's gate accepts nothing else
+      # from it, and deploy.sh refuses a tag, a foreign repository or an unsigned digest.
+      - name: deploy.sh
+        env:
+          SSH_TARGET: ${{ inputs.ssh-user }}@${{ inputs.ssh-host }}
+          SERVICE: ${{ inputs.service }}
+          REFERENCE: ${{ steps.image.outputs.reference }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -o ServerAliveInterval=15 "$SSH_TARGET" "deploy.sh ${SERVICE} ${REFERENCE}"
+
+      # deploy.sh judged the result from inside the server; this asks from outside.
+      - name: Smoke test from outside
+        if: inputs.smoke-url != ''
+        env:
+          URL: ${{ inputs.smoke-url }}
+        run: |
+          deadline=$((SECONDS + 120))
+          until curl -fsS --max-time 10 -o /dev/null "$URL"; do
+            [ "$SECONDS" -lt "$deadline" ] || { echo "::error::$URL did not answer"; exit 1; }
+            sleep 5
+          done
+
+      # Runs even when an earlier step failed, so no key stays on the runner.
+      - name: Remove the key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key ~/.ssh/known_hosts

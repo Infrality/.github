@@ -1,0 +1,140 @@
+name: Deploy staging (OFF)
+
+# PREPARED BUT SWITCHED OFF. There is no staging VM, no self-hosted runner and no
+# tunnel yet (decided Nov 2026). Nothing calls this file except the repositories'
+# `deploy-staging.yml`, which are `workflow_dispatch`-only, so nothing runs it and
+# nothing fails because staging is missing. It needs, before the first run:
+#
+#   - the homelab VM (Proxmox) built with platform's staging overlay
+#     (`INFRALITY_ENV=staging`, docs/OPERATIONS.md) and reachable from the runner;
+#   - a self-hosted runner on the homelab with the label `homelab` (the labels are
+#     the `runs-on` input), registered to the organisation;
+#   - STAGING_SSH_KEY / STAGING_KNOWN_HOSTS secrets, as for production but for the
+#     staging VM (no tailnet hop: the runner is on the same LAN).
+#
+# It is the same pipeline as production, one step further left: resolve the digest
+# of a tag, verify its signature, `deploy.sh <service> <digest>` through the gate,
+# then Playwright end-to-end tests and a k6 smoke run. The tests are on demand
+# only — they cost minutes — which is why they live here and not in ci-node.
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+      image:
+        type: string
+        required: true
+      ref:
+        description: Release tag (v1.2.3).
+        type: string
+        required: true
+      ssh-host:
+        type: string
+        required: true
+      ssh-user:
+        type: string
+        required: true
+      runs-on:
+        description: JSON array of runner labels.
+        type: string
+        default: '["self-hosted","homelab"]'
+      e2e-command:
+        description: Playwright command run in the checked-out tag, with BASE_URL set (empty = skip).
+        type: string
+        default: ''
+      k6-script:
+        description: k6 smoke script path in the repository (empty = skip).
+        type: string
+        default: ''
+      base-url:
+        description: Staging URL for the tests, e.g. https://app-staging.infrality.io.
+        type: string
+        default: ''
+    secrets:
+      STAGING_SSH_KEY:
+        required: true
+      STAGING_KNOWN_HOSTS:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-staging-${{ inputs.service }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.service }} ${{ inputs.ref }} to staging
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: image
+        name: Resolve the digest and verify its signature
+        env:
+          IMAGE: ${{ inputs.image }}
+          TAG: ${{ inputs.ref }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "::error::ref must be a release tag, got '$TAG'"; exit 1; }
+          repo="ghcr.io/${OWNER,,}/${IMAGE}"
+          digest="$(docker buildx imagetools inspect "${repo}:${TAG#v}" --format '{{.Manifest.Digest}}')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image ${repo}:${TAG#v}"; exit 1; }
+          cosign verify \
+            --certificate-identity-regexp "^https://github\\.com/Infrality/(\\.github|${IMAGE})/\\.github/workflows/image\\.yml@refs/(heads/main|tags/v.+)\$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${repo}@${digest}" > /dev/null
+          echo "reference=${repo}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: deploy.sh on the staging VM
+        env:
+          SSH_KEY: ${{ secrets.STAGING_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.STAGING_KNOWN_HOSTS }}
+          SSH_TARGET: ${{ inputs.ssh-user }}@${{ inputs.ssh-host }}
+          SERVICE: ${{ inputs.service }}
+          REFERENCE: ${{ steps.image.outputs.reference }}
+        run: |
+          install -d -m 700 ~/.ssh
+          (umask 077; printf '%s\n' "$SSH_KEY" > ~/.ssh/staging_key)
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts_staging
+          trap 'rm -f ~/.ssh/staging_key ~/.ssh/known_hosts_staging' EXIT
+          ssh -i ~/.ssh/staging_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts_staging -o ServerAliveInterval=15 \
+              "$SSH_TARGET" "deploy.sh ${SERVICE} ${REFERENCE}"
+
+      - name: Playwright end-to-end
+        if: inputs.e2e-command != ''
+        env:
+          CMD: ${{ inputs.e2e-command }}
+          BASE_URL: ${{ inputs.base-url }}
+        run: bash -euo pipefail -c "$CMD"
+
+      - uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
+        if: inputs.k6-script != ''
+
+      - name: k6 smoke
+        if: inputs.k6-script != ''
+        env:
+          SCRIPT: ${{ inputs.k6-script }}
+          BASE_URL: ${{ inputs.base-url }}
+        run: k6 run -e BASE_URL="$BASE_URL" "$SCRIPT"
