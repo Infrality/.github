@@ -1,0 +1,194 @@
+name: CI (Node)
+
+# Reusable gate for the Node repositories (api, app, website, docs, admin).
+# Called from a repository's own ci.yml on pull requests, so every step here is one
+# `make check` runs locally; the repository supplies its commands, this file supplies
+# the order and the pinned tooling.
+#
+#   jobs:
+#     ci:
+#       uses: Infrality/.github/.github/workflows/ci-node.yml@main
+#       with: { typecheck: npm run check, lint: npm run lint, build: npm run build, test: npm run test:ci }
+#
+# CodeQL and GitHub's dependency-review action need GitHub Advanced Security on a
+# private repository, which the Free plan does not include. Their jobs are done by
+# Semgrep (security.yml) and `npm audit` below instead.
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner label. GitHub-hosted for now; the homelab runner later.
+        type: string
+        default: ubuntu-latest
+      node-version:
+        type: string
+        default: '24'
+      setup-command:
+        description: Run after `npm ci` (for example `npx prisma generate`).
+        type: string
+        default: ''
+      typecheck:
+        type: string
+        default: ''
+      lint:
+        type: string
+        default: ''
+      build:
+        type: string
+        default: ''
+      test:
+        type: string
+        default: ''
+      env:
+        description: KEY=VALUE lines exported to every step of the quality and test jobs.
+        type: string
+        default: ''
+      audit:
+        description: '`npm audit --omit=dev --audit-level=high` (runtime dependencies only).'
+        type: boolean
+        default: true
+      hadolint:
+        description: Lint ./Dockerfile with the repository's .hadolint.yaml.
+        type: boolean
+        default: true
+      postgres:
+        description: Start a throwaway PostgreSQL 16 for the test job (DATABASE_URL comes from `env`).
+        type: boolean
+        default: false
+      migrate-command:
+        description: Run after PostgreSQL is up and before the tests.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Types, lint, build, audit
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install
+        env:
+          SETUP: ${{ inputs.setup-command }}
+          ENV_LINES: ${{ inputs.env }}
+        run: |
+          if [ -n "$ENV_LINES" ]; then printf '%s\n' "$ENV_LINES" >> "$GITHUB_ENV"; fi
+          npm ci --no-audit --no-fund
+          if [ -n "$SETUP" ]; then bash -euo pipefail -c "$SETUP"; fi
+
+      - name: Type check
+        if: inputs.typecheck != ''
+        env:
+          CMD: ${{ inputs.typecheck }}
+        run: bash -euo pipefail -c "$CMD"
+
+      # Check only: nothing is rewritten, and a warning fails it.
+      - name: Lint
+        if: inputs.lint != ''
+        env:
+          CMD: ${{ inputs.lint }}
+        run: bash -euo pipefail -c "$CMD"
+
+      - name: Build
+        if: inputs.build != ''
+        env:
+          CMD: ${{ inputs.build }}
+        run: bash -euo pipefail -c "$CMD"
+
+      - name: Audit dependencies
+        if: inputs.audit
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Lint workflows
+        run: >-
+          docker run --rm -v "$PWD:/repo" -w /repo
+          rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+          -color
+
+      - name: Lint Dockerfile
+        if: inputs.hadolint
+        run: |
+          # The repository's .hadolint.yaml when it has one, the default rules otherwise.
+          mount=(); args=(--failure-threshold warning)
+          if [ -f .hadolint.yaml ]; then
+            mount=(-v "$PWD/.hadolint.yaml:/.config/hadolint.yaml:ro"); args=(--config /.config/hadolint.yaml)
+          fi
+          docker run --rm -i "${mount[@]}" \
+            hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d \
+            hadolint "${args[@]}" - < Dockerfile
+
+  test:
+    name: Tests
+    if: inputs.test != ''
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      # A service container cannot be switched on by an input, so this is a plain
+      # `docker run`. The credentials are the throwaway ones DATABASE_URL names.
+      - name: PostgreSQL
+        if: inputs.postgres
+        run: |
+          docker run -d --name ci-postgres -p 5432:5432 \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=password -e POSTGRES_DB=infrality_test \
+            --health-cmd 'pg_isready -U postgres' --health-interval 3s --health-retries 20 \
+            postgres:16-alpine
+          for _ in $(seq 1 40); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' ci-postgres)" = healthy ] && exit 0
+            sleep 2
+          done
+          docker logs ci-postgres >&2
+          echo "::error::PostgreSQL did not become healthy"
+          exit 1
+
+      - name: Install
+        env:
+          SETUP: ${{ inputs.setup-command }}
+          ENV_LINES: ${{ inputs.env }}
+        run: |
+          if [ -n "$ENV_LINES" ]; then printf '%s\n' "$ENV_LINES" >> "$GITHUB_ENV"; fi
+          npm ci --no-audit --no-fund
+          if [ -n "$SETUP" ]; then bash -euo pipefail -c "$SETUP"; fi
+
+      - name: Migrate
+        if: inputs.migrate-command != ''
+        env:
+          CMD: ${{ inputs.migrate-command }}
+        run: bash -euo pipefail -c "$CMD"
+
+      - name: Tests
+        env:
+          CMD: ${{ inputs.test }}
+        run: bash -euo pipefail -c "$CMD"
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          [ -f coverage/coverage-summary.json ] || exit 0
+          {
+            echo '### Coverage'
+            echo '| | % | covered |'
+            echo '|---|---|---|'
+            jq -r '.total | to_entries[] | select(.key != "branchesTrue")
+              | "| \(.key) | \(.value.pct)% | \(.value.covered)/\(.value.total) |"' \
+              coverage/coverage-summary.json
+          } >> "$GITHUB_STEP_SUMMARY"

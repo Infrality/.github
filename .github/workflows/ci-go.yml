@@ -1,0 +1,146 @@
+name: CI (Go)
+
+# Reusable gate for the Go repository (agent). The steps are the ones `make check`
+# runs locally: modules, vet, golangci-lint, govulncheck, tests under the race
+# detector with a coverage gate, and the goreleaser configuration.
+#
+# CodeQL needs GitHub Advanced Security on a private repository; Semgrep
+# (security.yml) and govulncheck do that job here.
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner label. GitHub-hosted for now; the homelab runner later.
+        type: string
+        default: ubuntu-latest
+      golangci-lint-version:
+        type: string
+        default: v2.14.0
+      govulncheck-version:
+        type: string
+        default: v1.1.4
+      goreleaser-version:
+        type: string
+        default: v2.18.3
+      shellcheck-paths:
+        description: Space-separated shell scripts to shellcheck (empty skips it).
+        type: string
+        default: ''
+      coverage-gate:
+        description: Script run on coverage.out (empty = no gate beyond the tests passing).
+        type: string
+        default: ''
+      goreleaser-check:
+        description: Validate .goreleaser.yaml.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint, vet, modules, vulnerabilities
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # go.mod and go.sum are what a release builds from, so an untidy tree
+      # fails here rather than shipping.
+      - name: Modules are tidy and verified
+        run: |
+          go mod tidy -diff
+          go mod verify
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ inputs.golangci-lint-version }}
+
+      # Fails only on a vulnerability in code the program actually calls.
+      - name: govulncheck
+        env:
+          VERSION: ${{ inputs.govulncheck-version }}
+        run: go run "golang.org/x/vuln/cmd/govulncheck@${VERSION}" ./...
+
+      - name: Shellcheck
+        if: inputs.shellcheck-paths != ''
+        env:
+          PATHS: ${{ inputs.shellcheck-paths }}
+        run: |
+          read -r -a files <<< "$PATHS"
+          docker run --rm -v "$PWD:/mnt" -w /mnt \
+            koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d \
+            "${files[@]}"
+
+      - name: Lint workflows
+        run: >-
+          docker run --rm -v "$PWD:/repo" -w /repo
+          rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+          -color
+
+  test:
+    name: Build, test, coverage gate
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test (race detector, coverage)
+        run: go test -race -timeout 300s -coverprofile=coverage.out ./...
+
+      - name: Coverage gate
+        if: inputs.coverage-gate != ''
+        env:
+          GATE: ${{ inputs.coverage-gate }}
+        run: |
+          {
+            echo '### Coverage'
+            echo '```'
+            "$GATE" coverage.out
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          "$GATE" coverage.out > /dev/null
+
+  goreleaser-check:
+    name: Release config
+    if: inputs.goreleaser-check
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate goreleaser config
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: ${{ inputs.goreleaser-version }}
+          args: check
