@@ -1,0 +1,63 @@
+name: GHCR retention
+
+# The Free plan gives 500 MB of GHCR storage across the organisation's private images.
+# Weekly: keep the 10 newest release versions of each image (plus the signatures and
+# per-platform manifests they need) and delete the rest. scripts/ghcr-retention.sh
+# explains why "delete the untagged ones" alone would break signed images.
+#
+# Needs the secret GHCR_RETENTION_TOKEN: a personal access token (classic) with
+# read:packages and delete:packages, owned by an organisation owner. The workflow's
+# own GITHUB_TOKEN cannot delete other repositories' packages. Without the secret the
+# job says so and stops; it never fails the schedule.
+#
+# By hand (Actions → GHCR retention → Run workflow): a dry run unless `apply` is ticked.
+on:
+  schedule:
+    - cron: '17 4 * * 0'
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Actually delete (otherwise only print what would be deleted).
+        type: boolean
+        default: false
+      keep:
+        description: Release versions kept per image.
+        type: string
+        default: '10'
+
+permissions:
+  contents: read
+
+jobs:
+  retention:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [api, app, website, docs, admin]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prune
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_RETENTION_TOKEN }}
+          IMAGE: ${{ matrix.image }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          APPLY: ${{ github.event_name == 'schedule' || inputs.apply }}
+          KEEP: ${{ inputs.keep || '10' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::GHCR_RETENTION_TOKEN is not set: nothing pruned (see the header of this workflow)"
+            exit 0
+          fi
+          [[ "$KEEP" =~ ^[0-9]+$ ]] || { echo "::error::keep must be a number"; exit 1; }
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          args=(--keep "$KEEP")
+          if [ "$APPLY" = true ]; then args+=(--apply); fi
+          ./scripts/ghcr-retention.sh "${OWNER,,}" "$IMAGE" "${args[@]}"
