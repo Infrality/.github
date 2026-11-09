@@ -9,16 +9,16 @@ name: Deploy production
 #   2. `ref` must be a release tag (vX.Y.Z) that is in main's history;
 #   3. the digest of ghcr.io/infrality/<image>:<version> is resolved here, and its
 #      cosign signature is verified on the runner BEFORE the network is opened;
-#   4. the runner joins the tailnet as tag:ci with an ephemeral key (ACL: SSH to
-#      tag:prod only), and runs exactly one command, which the server's
-#      infrality-ssh-gate checks again:  deploy.sh <service> <image@sha256:…>
+#   4. the runner reaches the VPS over the public SSH port (SSH_HOST is the public IP,
+#      host key pinned, StrictHostKeyChecking=yes) and runs exactly one command, which
+#      the server's infrality-ssh-gate checks again:  deploy.sh <service> <image@sha256:…>
 #   5. the server verifies the signature itself, rolls out with no downtime, runs the
 #      smoke test and rolls back on failure (platform docs/DEPLOYING.md).
 #
-# Secrets the caller passes: TS_AUTHKEY (ephemeral, tag:ci), SSH_DEPLOY_KEY (the key
+# Secrets the caller passes: SSH_DEPLOY_KEY (the key
 # whose authorized_keys line carries `infrality-ssh-gate <role>`), SSH_KNOWN_HOSTS
 # (the server's host key, from `ssh-keyscan` run from a trusted machine — not fetched
-# here, so a hijacked tailnet name cannot be trusted on first use).
+# here, so nothing answering on that address is trusted on first use).
 on:
   workflow_call:
     inputs:
@@ -35,7 +35,7 @@ on:
         type: string
         required: true
       ssh-host:
-        description: The VPS on the tailnet (MagicDNS name or 100.x address).
+        description: The VPS's public IP (the SSH_HOST organisation variable).
         type: string
         required: true
       ssh-user:
@@ -46,8 +46,6 @@ on:
         type: string
         default: ''
     secrets:
-      TS_AUTHKEY:
-        required: true
       SSH_DEPLOY_KEY:
         required: true
       SSH_KNOWN_HOSTS:
@@ -118,13 +116,6 @@ jobs:
             "${repo}@${digest}" > /dev/null
           echo "reference=${repo}@${digest}" >> "$GITHUB_OUTPUT"
           echo "### ${SERVICE} → ${repo}@${digest}" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Join the tailnet as tag:ci
-        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
-        with:
-          authkey: ${{ secrets.TS_AUTHKEY }}
-          version: 1.104.4
-          hostname: gha-deploy-${{ github.run_id }}
 
       - name: Install the deploy key and the pinned host key
         env:

@@ -10,7 +10,7 @@ that is what lets the private repositories call it on the Free plan.
 | `security.yml` | TruffleHog, gitleaks, Semgrep (pinned containers) | every repo, on PRs and weekly |
 | `image.yml` | build → push by digest → Trivy (fails on HIGH/CRITICAL) → semver tag → SBOM (syft) → cosign keyless → verify | api, app, website, docs, admin |
 | `release-please.yml` | release PR (CHANGELOG + version) and the `vX.Y.Z` tag | every repo |
-| `deploy-prod.yml` | **manual button only**: verify, join the tailnet, `deploy.sh <service> <digest>` | api, app, website, docs, admin |
+| `deploy-prod.yml` | **manual button only**: verify, SSH to the VPS's public port, `deploy.sh <service> <digest>` | api, app, website, docs, admin |
 | `deploy-staging.yml` | same, to the homelab VM, then Playwright + k6. **Off**: see below | dispatch-only callers |
 | `ghcr-retention.yml` | weekly: keep the 10 newest releases per image (+ signatures), delete the rest | itself (schedule) |
 
@@ -63,14 +63,14 @@ weekly scan (`security.yml`), and `deploy-prod.yml` / `deploy-staging.yml`.
    `ghcr.io/infrality/<repo>:X.Y.Z` (and `@sha256:…`).
 3. **Actions → Deploy production → Run workflow**, `ref = vX.Y.Z`. Nothing else deploys to production.
    `deploy-prod.yml` refuses anything but a `workflow_dispatch` on `main` for a release tag that is in
-   `main`'s history; resolves the digest; verifies the signature; joins the tailnet as `tag:ci`; runs
+   `main`'s history; resolves the digest; verifies the signature; connects to the VPS's public SSH port (host key pinned, `StrictHostKeyChecking=yes`); runs
    `deploy.sh <service> <digest>` through the server's SSH gate, which rolls out with no downtime, smoke
    tests, and rolls back on failure.
 
 Images are built once and promoted: nothing environment-specific is baked in. `app` and `website` read
 `PUBLIC_*` at run time (`$env/dynamic/public`).
 
-## One-time setup (not code: do these in the GitHub / Tailscale UIs)
+## One-time setup (not code: do these in the GitHub UI)
 
 Organisation (Free plan: no Environments, no branch protection, 2,000 Actions minutes, 500 MB GHCR):
 
@@ -82,14 +82,13 @@ Organisation (Free plan: no Environments, no branch protection, 2,000 Actions mi
 
 | Where | Name | What |
 | --- | --- | --- |
-| org secret | `TS_AUTHKEY` | Tailscale auth key: **ephemeral**, reusable, pre-approved, tag `tag:ci` |
-| org var | `SSH_HOST`, `SSH_USER` | the VPS's tailnet name, and the deploy user |
-| org secret | `SSH_KNOWN_HOSTS` | the VPS host key line, from `ssh-keyscan` run from a trusted machine over the tailnet |
+| org var | `SSH_HOST`, `SSH_USER` | `SSH_HOST` is the VPS's **public IP**; `SSH_USER` the deploy user |
+| org secret | `SSH_KNOWN_HOSTS` | the VPS host key line, from `ssh-keyscan <public IP>` run from a trusted machine, fingerprint compared with the server's; pinned with `StrictHostKeyChecking=yes` |
 | repo secret | `SSH_DEPLOY_KEY_BACKEND` (api), `_FRONTEND` (app), `_WEBSITE`, `_DOCS`, `_ADMIN` | the existing per-service keys; their `authorized_keys` lines keep `command="infrality-ssh-gate <role>"` |
 | repo secret | `RELEASE_PLEASE_TOKEN` | optional PAT; **required for agent** so release-please's tag starts goreleaser's `release.yml` |
 | this repo secret | `GHCR_RETENTION_TOKEN` | PAT with `read:packages` + `delete:packages` (retention only) |
 
-Tailscale ACL: `tag:ci` may reach `tag:prod` on port 22 and nothing else (platform `docs/OPERATIONS.md`).
+CI does not use Tailscale: it reaches the VPS on the public SSH port 22, which the server hardens (UFW, fail2ban, key-only `AllowUsers`, one forced-command key per service; platform `docs/OPERATIONS.md`). Remove the old `TS_AUTHKEY` secret. Tailscale is for humans only (admin, Grafana, Prometheus, Traefik dashboard).
 
 ## What is switched off
 
