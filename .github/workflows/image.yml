@@ -203,6 +203,21 @@ jobs:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: docker buildx imagetools create --tag "${REPO}:${VERSION}" "${REPO}@${DIGEST}"
 
+      # `imagetools create` writes a NEW index for the tag, so the tag's digest is not the
+      # pushed one. Deploys resolve the tag, so both digests are signed and verified
+      # (found on the 2026-11-10 cutover: the tag's digest had no signature).
+      - id: tagged
+        name: Resolve the tag's digest
+        if: inputs.push
+        env:
+          REPO: ${{ steps.name.outputs.repo }}
+          VERSION: ${{ steps.name.outputs.version }}
+        run: |
+          set -euo pipefail
+          d="$(docker buildx imagetools inspect "${REPO}:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "$d" == sha256:* ]] || { echo "could not resolve ${REPO}:${VERSION}" >&2; exit 1; }
+          echo "digest=$d" >> "$GITHUB_OUTPUT"
+
       - name: SBOM (syft)
         if: inputs.push
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
@@ -225,9 +240,13 @@ jobs:
         if: inputs.push
         env:
           REF: ${{ steps.name.outputs.repo }}@${{ steps.push.outputs.digest }}
+          TAGGED: ${{ steps.name.outputs.repo }}@${{ steps.tagged.outputs.digest }}
         run: |
-          cosign sign --yes "$REF"
-          cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$REF"
+          set -euo pipefail
+          for r in "$REF" "$TAGGED"; do
+            cosign sign --yes "$r"
+            cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$r"
+          done
 
       # The same check the server makes (platform scripts/deploy-service.sh). A caller
       # on the wrong ref, or this file moved, fails here instead of at deploy time.
@@ -235,10 +254,15 @@ jobs:
         if: inputs.push
         env:
           REF: ${{ steps.name.outputs.repo }}@${{ steps.push.outputs.digest }}
+          TAGGED: ${{ steps.name.outputs.repo }}@${{ steps.tagged.outputs.digest }}
+          VERSION: ${{ steps.name.outputs.version }}
           IMAGE: ${{ inputs.image }}
         run: |
-          cosign verify \
-            --certificate-identity-regexp "^https://github\\.com/Infrality/(\\.github|${IMAGE})/\\.github/workflows/image\\.yml@refs/(heads/main|tags/v.+)\$" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "$REF" > /dev/null
-          echo "### ${REF}" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          for r in "$REF" "$TAGGED"; do
+            cosign verify \
+              --certificate-identity-regexp "^https://github\\.com/Infrality/(\\.github|${IMAGE})/\\.github/workflows/image\\.yml@refs/(heads/main|tags/v.+)\$" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$r" > /dev/null
+          done
+          echo "### ${VERSION} → ${TAGGED} (pushed as ${REF})" >> "$GITHUB_STEP_SUMMARY"
