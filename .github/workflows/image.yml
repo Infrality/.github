@@ -15,7 +15,9 @@ name: Container image
 #
 # Caller (pull request, no push):
 #   with: { image: app, push: false }
-# Caller (release, needs packages: write and id-token: write):
+# Caller (merge to main, needs packages: write and id-token: write):
+#   with: { image: app }            → ghcr.io/infrality/app:main-<sha7>, signed
+# Caller (release tag):
 #   with: { image: app, ref: v1.4.0 }
 #
 # The registry never holds an unscanned tag: the image is pushed by digest, scanned
@@ -99,13 +101,16 @@ jobs:
           [[ "$IMAGE" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || { echo "::error::bad image name '$IMAGE'"; exit 1; }
           version=ci
           if [ "$PUSH" = true ]; then
-            # Only a release tag is published: the tag is the version, and a
-            # branch name would make a registry tag nobody asked for.
-            if [[ ! "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-              echo "::error::push needs a release tag like v1.2.3 as 'ref', not '$REF'"
+            # Published: a release tag (v1.2.3 → 1.2.3), or a merge to main
+            # (empty ref → main-<short sha>). Nothing else gets a registry tag.
+            if [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              version="${REF#v}"
+            elif [ -z "$REF" ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+              version="main-${GITHUB_SHA::7}"
+            else
+              echo "::error::push needs a release tag like v1.2.3, or an empty ref on main; got '$REF' on $GITHUB_REF"
               exit 1
             fi
-            version="${REF#v}"
           fi
           {
             echo "repo=ghcr.io/${OWNER,,}/${IMAGE}"

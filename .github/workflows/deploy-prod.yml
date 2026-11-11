@@ -1,14 +1,17 @@
 name: Deploy production
 
-# Reusable. Production is deployed ONLY by a person pressing the button: the
-# repository's deploy-prod.yml is `workflow_dispatch` with one input, `ref` (a
-# release tag). Never on push. The organisation is on the Free plan (no Environment
-# approvals, no branch protection), so the safeguards are in this file instead:
+# Reusable. Production follows main: each application repository's ship.yml builds and
+# signs an image on every merge to main and calls this with the signed digest
+# (`reference`). Its deploy-prod.yml is the manual button, for a redeploy or a rollback
+# to an earlier build (`ref`: a release tag v1.2.3 or a main-<sha7> image tag). The
+# organisation is on the Free plan (no Environment approvals, no branch protection), so
+# the safeguards are in this file:
 #
-#   1. it runs from a workflow_dispatch on main, nothing else;
-#   2. `ref` must be a release tag (vX.Y.Z) that is in main's history;
-#   3. the digest of ghcr.io/infrality/<image>:<version> is resolved here, and its
-#      cosign signature is verified on the runner BEFORE the network is opened;
+#   1. it runs for a push to main or a workflow_dispatch on main, nothing else;
+#   2. a `reference` must be ghcr.io/infrality/<image>@sha256:…; a `ref` must be a
+#      release tag in main's history or a main-<sha7> tag;
+#   3. the cosign signature of that digest is verified on the runner BEFORE the
+#      network is opened (signed by Infrality's image workflow, nobody else);
 #   4. the runner reaches the VPS over the public SSH port (SSH_HOST is the public IP,
 #      host key pinned, StrictHostKeyChecking=yes) and runs exactly one command, which
 #      the server's infrality-ssh-gate checks again:  deploy.sh <service> <image@sha256:…>
@@ -31,9 +34,13 @@ on:
         type: string
         required: true
       ref:
-        description: Release tag to deploy (v1.2.3).
+        description: Image tag to deploy (v1.2.3 or main-<sha7>). Ignored when reference is set.
         type: string
-        required: true
+        default: ''
+      reference:
+        description: Signed digest from the image job (ghcr.io/infrality/<image>@sha256:…).
+        type: string
+        default: ''
       ssh-host:
         description: The VPS's public IP (the SSH_HOST organisation variable).
         type: string
@@ -61,20 +68,21 @@ concurrency:
 
 jobs:
   deploy:
-    name: Deploy ${{ inputs.service }} ${{ inputs.ref }}
+    name: Deploy ${{ inputs.service }} ${{ inputs.ref || 'from main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
       contents: read
       packages: read
     steps:
-      - name: Only from the button, on main, for a release tag
+      - name: Only from main, for a signed build
         env:
           EVENT: ${{ github.event_name }}
           WORKFLOW_REF: ${{ github.ref }}
           SERVICE: ${{ inputs.service }}
           IMAGE: ${{ inputs.image }}
           TAG: ${{ inputs.ref }}
+          REFERENCE: ${{ inputs.reference }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           SSH_HOST: ${{ inputs.ssh-host }}
@@ -93,14 +101,21 @@ jobs:
             printf '::error::not configured: %s (platform docs/OPERATIONS.md, "CI reaches the VPS")\n' "${missing[@]}"
             exit 1
           fi
-          [ "$EVENT" = workflow_dispatch ] || { echo "::error::production deploys run on workflow_dispatch only, not '$EVENT'"; exit 1; }
-          [ "$WORKFLOW_REF" = refs/heads/main ] || { echo "::error::run this workflow from main, not '$WORKFLOW_REF'"; exit 1; }
+          case "$EVENT" in push|workflow_dispatch) ;; *) echo "::error::production deploys run on a push to main or the button, not '$EVENT'"; exit 1 ;; esac
+          [ "$WORKFLOW_REF" = refs/heads/main ] || { echo "::error::production deploys run from main, not '$WORKFLOW_REF'"; exit 1; }
           [[ "$SERVICE" =~ ^(backend|dashboard|website|docs|admin)$ ]] || { echo "::error::unknown service '$SERVICE'"; exit 1; }
           [[ "$IMAGE" =~ ^(api|app|website|docs|admin)$ ]] || { echo "::error::unknown image '$IMAGE'"; exit 1; }
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::ref must be a release tag like v1.2.3, got '$TAG'"; exit 1; }
-          # A tag only counts if it is in main's history (behind = an ancestor).
-          status="$(gh api "repos/${REPO}/compare/main...${TAG}" --jq .status)"
-          case "$status" in behind|identical) ;; *) echo "::error::$TAG is not in main's history (compare says '$status')"; exit 1 ;; esac
+          if [ -n "$REFERENCE" ]; then
+            [[ "$REFERENCE" =~ ^ghcr\.io/infrality/${IMAGE}@sha256:[0-9a-f]{64}$ ]] || { echo "::error::reference must be ghcr.io/infrality/${IMAGE}@sha256:…, got '$REFERENCE'"; exit 1; }
+          elif [[ "$TAG" =~ ^main-[0-9a-f]{7}$ ]]; then
+            : # a build of main: its signature (checked next) proves where it came from
+          elif [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            # A release tag only counts if it is in main's history (behind = an ancestor).
+            status="$(gh api "repos/${REPO}/compare/main...${TAG}" --jq .status)"
+            case "$status" in behind|identical) ;; *) echo "::error::$TAG is not in main's history (compare says '$status')"; exit 1 ;; esac
+          else
+            echo "::error::ref must be v1.2.3 or main-<sha7>, got '$TAG'"; exit 1
+          fi
 
       - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         with:
@@ -118,12 +133,17 @@ jobs:
           IMAGE: ${{ inputs.image }}
           SERVICE: ${{ inputs.service }}
           TAG: ${{ inputs.ref }}
+          REFERENCE: ${{ inputs.reference }}
           OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
           repo="ghcr.io/${OWNER,,}/${IMAGE}"
-          digest="$(docker buildx imagetools inspect "${repo}:${TAG#v}" --format '{{.Manifest.Digest}}')"
-          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image ${repo}:${TAG#v}; was the release image published?"; exit 1; }
+          if [ -n "$REFERENCE" ]; then
+            digest="${REFERENCE#*@}"
+          else
+            digest="$(docker buildx imagetools inspect "${repo}:${TAG#v}" --format '{{.Manifest.Digest}}')"
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image ${repo}:${TAG#v}; was it built?"; exit 1; }
+          fi
           retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "::warning::attempt $i failed"; sleep $((i * 10)); done; return 1; }
           retry cosign verify \
             --certificate-identity-regexp "^https://github\\.com/Infrality/(\\.github|${IMAGE})/\\.github/workflows/image\\.yml@refs/(heads/main|tags/v.+)\$" \

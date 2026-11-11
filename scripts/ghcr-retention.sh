@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Keep the newest N release versions of one GHCR image, and everything they need;
+# Keep the newest N release (or main-<sha7>) versions of one GHCR image, and everything they need;
 # delete the rest.
 #
 #   scripts/ghcr-retention.sh <owner> <package> [--keep 10] [--min-age-hours 24] [--apply]
@@ -45,7 +45,8 @@ done
 [[ "$KEEP" =~ ^[0-9]+$ && "$KEEP" -ge 1 ]] || { echo "--keep must be a positive integer" >&2; exit 2; }
 [[ "$MIN_AGE_HOURS" =~ ^[0-9]+$ ]] || { echo "--min-age-hours must be an integer" >&2; exit 2; }
 
-SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+# Releases (1.2.3) and builds of main (main-<sha7>) both count as versions to keep.
+SEMVER_RE='^([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?|main-[0-9a-f]{7})$'
 REFERRER_RE='^sha256-[0-9a-f]{64}(\..+)?$'
 
 # Test hooks: a fixture instead of the API / the registry.
