@@ -124,7 +124,8 @@ jobs:
           repo="ghcr.io/${OWNER,,}/${IMAGE}"
           digest="$(docker buildx imagetools inspect "${repo}:${TAG#v}" --format '{{.Manifest.Digest}}')"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image ${repo}:${TAG#v}; was the release image published?"; exit 1; }
-          cosign verify \
+          retry() { for i in 1 2 3 4 5; do "$@" && return 0; echo "::warning::attempt $i failed"; sleep $((i * 10)); done; return 1; }
+          retry cosign verify \
             --certificate-identity-regexp "^https://github\\.com/Infrality/(\\.github|${IMAGE})/\\.github/workflows/image\\.yml@refs/(heads/main|tags/v.+)\$" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "${repo}@${digest}" > /dev/null
