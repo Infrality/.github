@@ -1,0 +1,22 @@
+name: Chore / ops
+description: Maintenance, infrastructure, dependencies, docs, cleanup
+title: "chore: "
+labels: ["type:chore"]
+body:
+  - type: textarea
+    id: task
+    attributes:
+      label: Task
+    validations: { required: true }
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Done when
+      value: |
+        - [ ] 
+    validations: { required: true }
+  - type: input
+    id: due
+    attributes:
+      label: Not before / due (optional)
+      placeholder: "2026-11-17"

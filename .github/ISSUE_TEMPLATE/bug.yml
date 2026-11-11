@@ -1,0 +1,35 @@
+name: Bug
+description: Something does not work as it should
+title: "fix: "
+labels: ["type:bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens, what should happen
+    validations: { required: true }
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: Steps, environment (prod / local), agent version, browser.
+    validations: { required: true }
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Logs, Grafana/Loki links, screenshots. Never paste secrets or customer data.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Done when
+      value: |
+        - [ ] A regression test reproduces the bug and now passes
+        - [ ] Gate green
+    validations: { required: true }
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options: ["P0 — users blocked / data / security", "P1 — degraded", "P2 — cosmetic"]
+    validations: { required: true }
