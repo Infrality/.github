@@ -77,8 +77,22 @@ jobs:
           TAG: ${{ inputs.ref }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
+          SSH_HOST: ${{ inputs.ssh-host }}
+          SSH_USER: ${{ inputs.ssh-user }}
+          HAS_KEY: ${{ secrets.SSH_DEPLOY_KEY != '' }}
+          HAS_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS != '' }}
         run: |
           set -euo pipefail
+          # Unset variables reach ssh as "@" and it only prints its usage line (exit 255).
+          missing=()
+          [ -n "$SSH_HOST" ] || missing+=("variable SSH_HOST")
+          [ -n "$SSH_USER" ] || missing+=("variable SSH_USER")
+          [ "$HAS_KEY" = true ] || missing+=("this repository's SSH_DEPLOY_KEY_* secret")
+          [ "$HAS_KNOWN_HOSTS" = true ] || missing+=("secret SSH_KNOWN_HOSTS")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf '::error::not configured: %s (platform docs/OPERATIONS.md, "CI reaches the VPS")\n' "${missing[@]}"
+            exit 1
+          fi
           [ "$EVENT" = workflow_dispatch ] || { echo "::error::production deploys run on workflow_dispatch only, not '$EVENT'"; exit 1; }
           [ "$WORKFLOW_REF" = refs/heads/main ] || { echo "::error::run this workflow from main, not '$WORKFLOW_REF'"; exit 1; }
           [[ "$SERVICE" =~ ^(backend|dashboard|website|docs|admin)$ ]] || { echo "::error::unknown service '$SERVICE'"; exit 1; }
