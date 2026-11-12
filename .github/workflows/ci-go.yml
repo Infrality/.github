@@ -79,7 +79,13 @@ jobs:
         env:
           PATHS: ${{ inputs.shellcheck-paths }}
         run: |
-          read -r -a files <<< "$PATHS"
+          # The paths are globs (scripts/*.sh): expand them here, docker gets no shell.
+          read -r -a patterns <<< "$PATHS"
+          shopt -s nullglob globstar
+          files=()
+          # shellcheck disable=SC2206 # the pattern must be unquoted to be expanded
+          for p in "${patterns[@]}"; do files+=( $p ); done
+          [ "${#files[@]}" -gt 0 ] || { echo "::error::no file matches '$PATHS'"; exit 1; }
           docker run --rm -v "$PWD:/mnt" -w /mnt \
             koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d \
             "${files[@]}"
