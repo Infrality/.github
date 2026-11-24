@@ -22,6 +22,10 @@ on:
       manifest-file:
         type: string
         default: .release-please-manifest.json
+      runs-on:
+        description: Runner label (vars.CI_RUNNER). Only a private repository may pick a self-hosted one.
+        type: string
+        default: ubuntu-latest
     secrets:
       RELEASE_PLEASE_TOKEN:
         required: false
@@ -38,7 +42,7 @@ permissions:
 
 jobs:
   release-please:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event.repository.visibility != 'public' && inputs.runs-on) || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: write
