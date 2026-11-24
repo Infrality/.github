@@ -7,12 +7,14 @@ that is what lets the private repositories call it on the Free plan.
 | --- | --- | --- |
 | `ci-node.yml` | install, typecheck, lint, build, `npm audit`, actionlint, hadolint, tests (optional throwaway PostgreSQL) | api, app, website, docs, admin |
 | `ci-go.yml` | modules, vet, golangci-lint, govulncheck, race tests + coverage gate, goreleaser check | agent |
-| `security.yml` | TruffleHog, gitleaks, Semgrep (pinned containers) | every repo, on PRs and weekly |
+| `security.yml` | TruffleHog, gitleaks, Semgrep (pinned containers) | every repo, on PRs and on a schedule |
 | `image.yml` | build → push by digest → Trivy (fails on HIGH/CRITICAL) → semver tag → SBOM (syft) → cosign keyless → verify | api, app, website, docs, admin |
 | `release-please.yml` | release PR (CHANGELOG + version) and the `vX.Y.Z` tag | every repo |
 | `deploy-prod.yml` | **manual button only**: verify, SSH to the VPS's public port, `deploy.sh <service> <digest>` | api, app, website, docs, admin |
 | `deploy-staging.yml` | same, to the homelab VM, then Playwright + k6. **Off**: see below | dispatch-only callers |
 | `ghcr-retention.yml` | weekly: keep the 10 newest releases per image (+ signatures), delete the rest | itself (schedule) |
+| `tested-tree.yml` | was main's tree already green on its pull request? (lets Ship skip a second CI run) | each repo's ship.yml |
+| `switch-runner.yml` | sets `CI_RUNNER` (hosted / private runner) in every private repo: [docs/CI-RUNNER.md](docs/CI-RUNNER.md) | by hand (mobile-friendly) |
 
 `default.json` is the shared Renovate preset (`"extends": ["github>Infrality/.github"]`).
 `make check` is this repository's gate (actionlint, shellcheck, pins, retention self-test, gitleaks).

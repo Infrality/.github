@@ -1,0 +1,43 @@
+name: Switch CI runner
+
+# The one-tap switch, usable from the GitHub mobile app (Actions → Switch CI runner → Run
+# workflow): sets CI_RUNNER in every private repository, through scripts/ci-runner.sh.
+#   self-hosted → infrality-ci (the private runner VM)
+#   hosted      → ubuntu-latest (GitHub-hosted; the fallback when the VM is down)
+#
+# This repository is public, so this job runs on GitHub-hosted runners (free here) and never on
+# the private runner. It needs the secret RUNNER_SWITCH_TOKEN: a fine-grained personal access
+# token, resource owner Infrality, only the private repositories, permission
+# "Variables: Read and write" and nothing else. Without it the job says so and fails.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Where the Linux jobs of the private repositories run
+        type: choice
+        options: [hosted, self-hosted, status]
+        default: status
+
+permissions:
+  contents: read
+
+concurrency:
+  group: switch-runner
+  cancel-in-progress: false
+
+jobs:
+  switch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set CI_RUNNER
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_SWITCH_TOKEN }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          [ -n "$GH_TOKEN" ] || { echo "::error::secret RUNNER_SWITCH_TOKEN is not set (see this file's header)"; exit 1; }
+          ./scripts/ci-runner.sh "$MODE" | tee -a "$GITHUB_STEP_SUMMARY"
