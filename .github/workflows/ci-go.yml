@@ -10,7 +10,7 @@ on:
   workflow_call:
     inputs:
       runs-on:
-        description: Runner label. GitHub-hosted for now; the homelab runner later.
+        description: Runner label. Callers pass vars.CI_RUNNER; only a private repository may pick a self-hosted one (docs/CI-RUNNER.md).
         type: string
         default: ubuntu-latest
       golangci-lint-version:
@@ -35,13 +35,14 @@ on:
         type: boolean
         default: true
 
-permissions:
-  contents: read
+# No `permissions:` here on purpose: the jobs inherit the caller's token (`contents: read`, plus
+# `statuses: write` so the tree can be recorded). Asking for more here than a caller grants
+# would make that caller's workflow invalid.
 
 jobs:
   lint:
     name: Lint, vet, modules, vulnerabilities
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ (github.event.repository.visibility != 'public' && inputs.runs-on) || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -96,9 +97,22 @@ jobs:
           rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
           -color
 
+      # The tree this pull request run checked (see ci-node.yml and tested-tree.yml). Never fails.
+      - name: Record the tested tree
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          gh api -X POST "repos/${REPO}/statuses/${HEAD}" -f state=success -f context=ci/tree \
+            -f description="$tree" > /dev/null \
+            || echo "::notice::tree not recorded (no statuses: write)"
+
   test:
     name: Build, test, coverage gate
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ (github.event.repository.visibility != 'public' && inputs.runs-on) || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -132,7 +146,7 @@ jobs:
   goreleaser-check:
     name: Release config
     if: inputs.goreleaser-check
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ (github.event.repository.visibility != 'public' && inputs.runs-on) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
