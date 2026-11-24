@@ -12,7 +12,12 @@
   "schedule": ["before 6am on the first day of the month"],
   "minimumReleaseAge": "7 days",
   "prHourlyLimit": 4,
-  "prConcurrentLimit": 6,
+  "prConcurrentLimit": 3,
+  "lockFileMaintenance": {
+    "description": "config:best-practices makes it weekly; monthly with everything else (each lock-file PR runs the full CI and the image scan).",
+    "enabled": true,
+    "schedule": ["before 6am on the first day of the month"]
+  },
   "labels": ["dependencies"],
   "vulnerabilityAlerts": {
     "schedule": ["at any time"],

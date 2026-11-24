@@ -1,0 +1,82 @@
+name: Tested tree
+
+# Reusable. Answers one question for Ship: was this exact tree already checked, and green, on
+# its pull request? If yes, Ship can skip re-running CI on main and go straight to the image
+# (build, Trivy, cosign) and the deploy (verify, smoke test, rollback), which always run.
+#
+#   tested=true  only when ALL of these hold:
+#     - the event is a push (a workflow_dispatch of Ship always runs the full CI);
+#     - the pushed commit belongs to a merged pull request;
+#     - that pull request's head carries the `ci/tree` status that ci-node.yml / ci-go.yml
+#       record, and its description is exactly the tree of the commit on main;
+#     - the latest pull_request run of the caller's CI workflow for that head concluded success.
+#
+# A pull request merged after main moved on has a different merge tree, so CI runs again: what
+# reaches production is always a tree that went through CI. Any doubt or API error answers
+# `false` (run CI), never a failure, so this job cannot stop a Ship by itself.
+#
+# Caller (ship.yml):
+#   gate:
+#     permissions: { contents: read, actions: read, pull-requests: read, statuses: read }
+#     uses: Infrality/.github/.github/workflows/tested-tree.yml@main
+#     with: { runs-on: "${{ vars.CI_RUNNER || 'ubuntu-latest' }}" }
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Runner label (vars.CI_RUNNER). Only a private repository may pick a self-hosted one.
+        type: string
+        default: ubuntu-latest
+      ci-workflow:
+        description: File name of the caller's pull request CI workflow.
+        type: string
+        default: ci.yml
+    outputs:
+      tested:
+        description: "'true' when main's tree already passed CI on its pull request."
+        value: ${{ jobs.tree.outputs.tested }}
+
+permissions:
+  contents: read
+
+jobs:
+  tree:
+    name: Already tested?
+    runs-on: ${{ (github.event.repository.visibility != 'public' && inputs.runs-on) || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+      statuses: read
+    outputs:
+      tested: ${{ steps.check.outputs.tested }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+          CI: ${{ inputs.ci-workflow }}
+        run: |
+          set -uo pipefail
+          answer() { echo "tested=$1" >> "$GITHUB_OUTPUT"; echo "### CI on main: $2" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          [ "$EVENT" = push ] || answer false "runs ($EVENT always runs it)"
+
+          tree="$(gh api "repos/${REPO}/git/commits/${SHA}" --jq .tree.sha 2>/dev/null)" || answer false "runs (tree unknown)"
+          pr="$(gh api "repos/${REPO}/commits/${SHA}/pulls" \
+                --jq '[.[] | select(.merged_at != null)][0].number // empty' 2>/dev/null)" || pr=""
+          [ -n "$pr" ] || answer false "runs (no merged pull request for ${SHA::7})"
+
+          head="$(gh api "repos/${REPO}/pulls/${pr}" --jq .head.sha 2>/dev/null)" || answer false "runs (#${pr} unreadable)"
+          # Statuses come newest first: the last tree CI recorded for this head.
+          recorded="$(gh api "repos/${REPO}/commits/${head}/statuses?per_page=100" \
+                --jq '[.[] | select(.context == "ci/tree" and .state == "success")][0].description // empty' 2>/dev/null)" || recorded=""
+          conclusion="$(gh api "repos/${REPO}/actions/workflows/${CI}/runs?event=pull_request&head_sha=${head}&per_page=1" \
+                --jq '.workflow_runs[0].conclusion // empty' 2>/dev/null)" || conclusion=""
+
+          if [ "$recorded" = "$tree" ] && [ "$conclusion" = success ]; then
+            answer true "skipped: tree ${tree::12} passed on #${pr}"
+          fi
+          answer false "runs (#${pr}: recorded tree '${recorded::12}', main ${tree::12}, last CI '${conclusion:-none}')"
