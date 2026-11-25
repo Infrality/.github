@@ -1,6 +1,9 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": [
-    "config:recommended"
-  ]
+  "extends": ["config:recommended"],
+  "description": "Paused for the trip: no Renovate run in December (the monthly window skips month 12), so the next run is 1 January. Vulnerability alerts are not paused. Remove the schedule and lockFileMaintenance afterwards.",
+  "schedule": ["* 0-5 1 1-11 *"],
+  "lockFileMaintenance": {
+    "schedule": ["* 0-5 1 1-11 *"]
+  }
 }
