@@ -8,3 +8,4 @@ Reusable GitHub Actions workflows for every Infrality repo (README.md explains t
 - `.github/workflows/image.yml` must not be renamed or moved: its path is in the cosign identity that
   platform's `deploy-service.sh` verifies.
 - Never push, never commit to `main`; `feat/…`, `fix/…`, `chore/…` branches, conventional commits.
+- Work on dev. main only receives dev merges before a release.
